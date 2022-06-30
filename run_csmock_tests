@@ -1,0 +1,191 @@
+#!/usr/bin/python3
+
+import argparse
+import configparser
+import fcntl
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+
+from contextlib import contextmanager
+
+from copr_builder import PACKAGE_CONF, GIT_BRANCH_CONF
+from copr_builder.srpm_builder import SRPMBuilder
+from copr_builder.errors import SRPMBuilderError
+
+
+CSMOCK_TOOLS = 'csmock_tools'
+CSMOCK_PROFILE = 'csmock_profile'
+
+SCAN_LOG_FILES = ['scan-results.html', 'scan-results.err', 'scan.log']
+
+
+log = logging.getLogger("csmock")
+
+
+def run_command(command, cwd=None):
+    res = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, cwd=cwd)
+
+    out, err = res.communicate()
+    return (res.returncode, out.decode().strip(), err.decode().strip())
+
+
+def _get_tarball(output):
+    # try to get location of tarball with results from output
+    # there might be multiple lines starting with 'Wrote:' we need the one
+    # with tarball (ending .tar.xz)
+    for line in output.split('\n'):
+        if line.startswith('Wrote: ') and line.endswith('.tar.xz'):
+            return line.split('Wrote: ')[1]
+    return None
+
+
+@contextmanager
+def flock(filename):
+    with open(filename, 'w+') as f:
+        fd = f.fileno()
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        yield
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def run_csmock_tests(project_config, tools, mock_profiles):
+    # build srpm from master branch
+    try:
+        stable_srpm_builder = SRPMBuilder(project_config)
+        stable_srpm_builder.prepare_build()
+        stable_srpm_builder.make_archive()
+        stable_srpm = stable_srpm_builder.build()
+    except SRPMBuilderError as e:
+        log.error('Failed to generate SRPM for %s:\n%s', project_config[PACKAGE_CONF], str(e))
+        return False
+    else:
+        log.info('SRPM for %s from %s successfully created.', project_config[PACKAGE_CONF], project_config[GIT_BRANCH_CONF])
+
+    # build new srpm from current directory
+    try:
+        new_srpm_builder = SRPMBuilder(project_config, git_dir='.')
+        new_srpm_builder.make_archive()
+        new_srpm = new_srpm_builder.build()
+    except SRPMBuilderError as e:
+        log.error('Failed to generate SRPM for %s:\n%s', project_config[PACKAGE_CONF], str(e))
+        return False
+    else:
+        log.info('SRPM for %s from local git successfully created.', project_config[PACKAGE_CONF])
+
+    if tools is None or tools == ['all']:
+        tools_cmd = '--all-tools'
+    else:
+        tools_cmd = '--tools %s' % ','.join(tools)
+
+    success = True
+    for mock_profile in mock_profiles:
+        print()  # add newline
+        msg = 'Profile %s: Running csmock...' % mock_profile
+        log.info(msg)
+        log.info('-' * len(msg) + '\n')
+
+        with flock('/tmp/mock_%s.lock' % mock_profile):
+            ret, _out, err = run_command('csmock --no-print-defects %s '
+                                         '--base-srpm %s %s %s' % (tools_cmd, stable_srpm,
+                                                                   '-r %s' % mock_profile,
+                                                                   new_srpm))
+
+        if ret != 0:
+            log.error('Profile %s: Running csmock failed:\n%s.', mock_profile, err)
+            success = False
+
+        results = _get_tarball(err)
+        if not results:
+            log.error('Profile %s: Failed to get results tarball from csmock. '
+                      'Failed to parse output:\n%s', mock_profile, err)
+            success = False
+            continue
+        else:
+            log.debug('Profile %s: Archive with results: "%s"', mock_profile, results)
+
+        # only try to get results from tarball if csmock command was successful
+        scan_results = False
+        if ret == 0:  # use csmock command return code, not the overall run success
+            with tarfile.open(results, 'r|xz') as tar:
+                for member in tar:
+                    # ignore files in subdirectories -- there are separate results from
+                    # both SRMPs containing errors we want to ignore
+                    if member.name.count('/') > 1:
+                        continue
+                    # check content of 'scan-results-summary.txt' to see if scan failed
+                    if member.name.endswith('scan-results-summary.txt'):
+                        summary = tar.extractfile(member).read().decode()
+                        if summary:
+                            log.error('Profile %s: Scan failed. Defects found:\n%s', mock_profile, summary)
+                            scan_results = False
+                        else:
+                            log.info('Profile %s: Scan completed. No defects found.', mock_profile)
+                            scan_results = True
+
+                    # extract log files we want to safe
+                    if os.path.basename(member.name) in SCAN_LOG_FILES:
+                        # change member name to extract it without the directory
+                        member.name = os.path.basename(member.name)
+                        tar.extract(member, path='.')
+
+                        log.debug('Profile %s: Extracted log file "%s"', mock_profile, member.name)
+
+        # move results tarball and extracted logs into a directory
+        logdir = 'csmock_%s_results' % mock_profile
+        os.makedirs(logdir)
+        for logfile in SCAN_LOG_FILES + [os.path.basename(results)]:
+            if os.path.exists(logfile):
+                shutil.move(logfile, os.path.join(logdir, logfile))
+
+        if not scan_results:
+            success = False
+            res_file = os.path.join(logdir, 'scan-results.err')
+            if not os.path.exists(res_file):
+                log.error('Profile %s: csmock scan failed but results file with errors not found.', mock_profile)
+                continue
+
+            with open(res_file, 'r') as f:
+                print(30 * '=', res_file, '(%s)' % mock_profile, 30 * '=')
+                for line in f:
+                    print(line)
+
+    return success
+
+
+if __name__ == '__main__':
+
+    argparser = argparse.ArgumentParser(description='csmock test')
+    argparser.add_argument('-v', '--verbose', action='store_true', help='print debug messages')
+    argparser.add_argument('-p', '--project', dest='project', action='store',
+                           help='project to run tests for', required=True)
+    argparser.add_argument('-c', '--config', dest='config', action='store',
+                           help='config file location', required=True)
+    argparser.add_argument('-t', '--tools', dest='tools', nargs='*', action='store',
+                           help='csmock tools to use (defaults to all available tools)')
+    argparser.add_argument('-r', '--roots', dest='roots', nargs='+', action='store',
+                           help='mock profiles to use (defaults to mock\'s default)')
+    args = argparser.parse_args()
+
+    if not os.path.exists(args.config):
+        print('Config file "%s" not found.', args.config)
+        sys.exit(1)
+
+    logging.basicConfig(stream=sys.stderr, format='%(name)s: %(message)s')
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
+    else:
+        log.setLevel(logging.INFO)
+
+    config = configparser.ConfigParser()
+    config.read(args.config)
+
+    suc = run_csmock_tests(config[args.project], args.tools, args.roots)
+
+    sys.exit(0 if suc else 1)
