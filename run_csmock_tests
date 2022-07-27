@@ -20,6 +20,10 @@ from copr_builder.errors import SRPMBuilderError
 CSMOCK_TOOLS = 'csmock_tools'
 CSMOCK_PROFILE = 'csmock_profile'
 
+MOCK_DIR = '/etc/mock'
+MOCK_PREFIX = 'storage'
+MOCK_ARCH = 'x86_64'
+
 SCAN_LOG_FILES = ['scan-results.html', 'scan-results.err', 'scan.log']
 
 
@@ -55,6 +59,45 @@ def flock(filename):
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+def write_file(filename, content):
+    with open(filename, 'w+', encoding='utf-8') as f:
+        f.write(content)
+
+
+def _get_default_profile():
+    default_path = os.path.realpath('/etc/mock/default.cfg')
+    default_name = os.path.basename(default_path)
+    return '-'.join(default_name.split('-')[:2])
+
+
+def _prepare_mock_config(mock_profile):
+    name = f'{MOCK_PREFIX}-{mock_profile}-{MOCK_ARCH}'
+
+    profile = f'''
+include("/etc/mock/{mock_profile}-{MOCK_ARCH}.cfg")
+
+config_opts["root"] = "{name}"
+
+config_opts["nosync"] = True
+
+config_opts["yum.conf"] += """
+
+[group_storage-udisks-daily]
+name=Copr repo for udisks-daily owned by @storage
+baseurl=https://copr-be.cloud.fedoraproject.org/results/@storage/udisks-daily/{mock_profile}-$basearch/
+enabled=1
+skip_if_unavailable=True
+"""
+'''
+
+    if not os.path.exists(MOCK_DIR):
+        os.makedirs(MOCK_DIR)
+
+    write_file(os.path.join(MOCK_DIR, f'{name}.cfg'), profile)
+
+    return name
+
+
 def run_csmock_tests(project_config, tools, mock_profiles):
     # build srpm from master branch
     try:
@@ -86,10 +129,17 @@ def run_csmock_tests(project_config, tools, mock_profiles):
 
     success = True
     for mock_profile in mock_profiles:
+        # translate 'default' profile to the full name
+        if mock_profile == 'default':
+            mock_profile = _get_default_profile()
+
         print()  # add newline
         msg = 'Profile %s: Running csmock...' % mock_profile
         log.info(msg)
         log.info('-' * len(msg) + '\n')
+
+        # prepare our custom mock profile
+        mock_profile = _prepare_mock_config(mock_profile)
 
         with flock('/tmp/mock_%s.lock' % mock_profile):
             ret, _out, err = run_command('csmock --no-print-defects %s '
