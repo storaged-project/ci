@@ -1,0 +1,169 @@
+#!/usr/bin/python3
+
+import argparse
+import configparser
+import glob
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+
+from copr_builder import PACKAGE_CONF
+from copr_builder.srpm_builder import SRPMBuilder
+from copr_builder.errors import SRPMBuilderError
+
+
+log = logging.getLogger('rpmbuild')
+
+
+MOCK_DIR = os.path.expanduser('~/.config/mock')
+MOCK_PREFIX = 'storage'
+MOCK_ARCH = 'x86_64'
+
+
+def run_command(command, cwd=None):
+    res = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, cwd=cwd)
+
+    out, err = res.communicate()
+    return (res.returncode, out.decode().strip(), err.decode().strip())
+
+
+def read_file(filename):
+    with open(filename, 'r', encoding='utf-8') as f:
+        content = f.read()
+    return content
+
+
+def write_file(filename, content):
+    with open(filename, 'w+', encoding='utf-8') as f:
+        f.write(content)
+
+
+def _gather_logs(temp_dir, mock_profile):
+    log_files = glob.glob(os.path.join(temp_dir, '*.log'))
+    with open(f'rpmbuild_{mock_profile}.log', 'w+', encoding='utf-8') as output:
+        output.write('================= LOGS =================\n')
+        for file in log_files:
+            content = read_file(file)
+            output.write(f'+++{os.path.basename(file)}+++\n')
+            output.write(content)
+
+
+def _prepare_mock_config(mock_profile):
+    name = f'{MOCK_PREFIX}-{mock_profile}-{MOCK_ARCH}'
+
+    profile = f'''
+include("/etc/mock/{mock_profile}-{MOCK_ARCH}.cfg")
+
+config_opts["root"] = "{name}"
+
+config_opts["nosync"] = True
+
+config_opts["yum.conf"] += """
+
+[group_storage-udisks-daily]
+name=Copr repo for udisks-daily owned by @storage
+baseurl=https://copr-be.cloud.fedoraproject.org/results/@storage/udisks-daily/{mock_profile}-$basearch/
+enabled=1
+skip_if_unavailable=True
+"""
+'''
+
+    if not os.path.exists(MOCK_DIR):
+        os.makedirs(MOCK_DIR)
+
+    write_file(os.path.join(MOCK_DIR, f'{name}.cfg'), profile)
+
+    return name
+
+
+def run_rpmbuild_tests(project_config, mock_profiles):
+    # build srpm
+    try:
+        srpm_builder = SRPMBuilder(project_config)
+        srpm_builder.prepare_build()
+        srpm_builder.make_archive()
+        srpm = srpm_builder.build()
+    except SRPMBuilderError as e:
+        log.error('Failed to generate SRPM for %s:\n%s', project_config[PACKAGE_CONF], str(e))
+        return False
+    else:
+        log.info('SRPM for %s successfully created.', project_config[PACKAGE_CONF])
+
+    summary = ''
+    success = True
+    for mock_profile in mock_profiles:
+        log.info('Profile %s:', mock_profile)
+        log.info('\tRunning mock...')
+
+        # prepare our custom mock profile
+        mock_profile = _prepare_mock_config(mock_profile)
+
+        ret, _out, err = run_command(f'mock -r {mock_profile} --init')
+        if ret != 0:
+            log.error('\tFailed to initialize mock: %s', err)
+            success = False
+            continue
+        log.info('\tMock initialization completed')
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            ret, _out, err = run_command(f'mock -r {mock_profile} --rebuild "{srpm}" --resultdir {tempdir}')
+            if ret != 0:
+                log.error('\tFailed to rebuild SRPM: %s', err)
+                _gather_logs(tempdir, mock_profile)
+                success = False
+                summary += f'{mock_profile}: FAILED\n'
+                continue
+            log.info('\tSRPM rebuild completed')
+
+            packages = glob.glob(os.path.join(tempdir, '*.noarch.rpm')) + glob.glob(os.path.join(tempdir, f'*.{MOCK_ARCH}.rpm'))
+            ret, _out, err = run_command(f'mock -r {mock_profile} --install {" ".join(packages)}')
+            if ret != 0:
+                log.error('\tFailed to install packages: %s', err)
+                _gather_logs(tempdir, mock_profile)
+                success = False
+                summary += f'{mock_profile}: FAILED\n'
+                continue
+            log.info('\tPackage installation completed')
+
+            _gather_logs(tempdir, mock_profile)
+
+        summary += f'{mock_profile}: SUCCESS\n'
+
+    print()  # adding a new line
+    log.info('======= SUMMARY =======')
+    log.info(summary)
+
+    return success
+
+
+if __name__ == '__main__':
+
+    argparser = argparse.ArgumentParser(description='rpmbuild test')
+    argparser.add_argument('-v', '--verbose', action='store_true', help='print debug messages')
+    argparser.add_argument('-p', '--project', dest='project', action='store',
+                           help='project to run tests for', required=True)
+    argparser.add_argument('-c', '--config', dest='config', action='store',
+                           help='config file location', required=True)
+    argparser.add_argument('-r', '--roots', dest='roots', nargs='+', action='store',
+                           help='mock profiles to use (defaults to mock\'s default)')
+    args = argparser.parse_args()
+
+    if not os.path.exists(args.config):
+        print(f'Config file "{args.config}" not found.')
+        sys.exit(1)
+
+    logging.basicConfig(stream=sys.stderr, format='%(message)s')
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
+    else:
+        log.setLevel(logging.INFO)
+
+    config = configparser.ConfigParser()
+    config.read(args.config)
+
+    suc = run_rpmbuild_tests(config[args.project], args.roots)
+
+    sys.exit(0 if suc else 1)
