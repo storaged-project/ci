@@ -80,10 +80,9 @@ skip_if_unavailable=True
 
 
 def run_rpmbuild_tests(project_config, mock_profiles):
-    # build srpm
+    # build srpm from current directory
     try:
-        srpm_builder = SRPMBuilder(project_config)
-        srpm_builder.prepare_build()
+        srpm_builder = SRPMBuilder(project_config, git_dir='.')
         srpm_builder.make_archive()
         srpm = srpm_builder.build()
     except SRPMBuilderError as e:
