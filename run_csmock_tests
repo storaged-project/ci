@@ -141,9 +141,12 @@ def run_csmock_tests(project_config, tools, mock_profiles):
         # prepare our custom mock profile
         mock_profile = _prepare_mock_config(mock_profile)
 
+        # extra arguments
+        extra = '--cppcheck-add-flag="--check-level=exhaustive"'
+
         with flock('/tmp/mock_%s.lock' % mock_profile):
-            ret, _out, err = run_command('csmock --no-print-defects %s '
-                                         '--base-srpm %s %s %s' % (tools_cmd, stable_srpm,
+            ret, _out, err = run_command('csmock --no-print-defects %s %s '
+                                         '--base-srpm %s %s %s' % (extra, tools_cmd, stable_srpm,
                                                                    '-r %s' % mock_profile,
                                                                    new_srpm))
 
