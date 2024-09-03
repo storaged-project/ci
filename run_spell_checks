@@ -1,0 +1,100 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+
+
+IGNORED_FILES = [r"'\.(pdf|xz)$'", r"^po/", r"LICENSE"]
+
+
+def run_command(command, cwd=None):
+    res = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, cwd=cwd)
+
+    out, err = res.communicate()
+    return (res.returncode, out.decode().strip(), err.decode().strip())
+
+
+
+def write_file(filename, content):
+    with open(filename, 'w+', encoding='utf-8') as f:
+        f.write(content)
+
+
+def _run_spellintian(ignored, cwd=None):
+    ignore = " ".join(["-e " + i for i in IGNORED_FILES])
+    ret, out, err = run_command("git ls-tree -rz --name-only HEAD | grep -Evz %s | xargs -r0 spellintian | grep -v \"(duplicate word)\"" % ignore,
+                                cwd=cwd)
+    if ret != 0:
+        raise RuntimeError("Failed to run codespell: %s %s" % (out, err))
+    errors = out.split("\n")
+    return [e for e in errors if ignored and any(i for i in ignored if i not in e)]
+
+
+def _run_codespell(ignored, cwd=None):
+    ignored_files = " ".join(["-e " + i for i in IGNORED_FILES])
+    ignored_words = "-L " + ",".join(ignored) if ignored else ""
+    _ret, out, err = run_command("git ls-tree -rz --name-only HEAD | grep -Evz %s | xargs -r0 codespell %s" % (ignored_files, ignored_words),
+                                cwd=cwd)
+    if err:
+        raise RuntimeError("Failed to run codespell: %s" % err)
+    return out.strip().split("\n")
+
+
+def _check_stable(project, ignored):
+    errors = ["", ""]
+    with tempfile.TemporaryDirectory() as dname:
+        ret, _out, err = run_command("git clone https://github.com/storaged-project/%s" % project,
+                                     cwd=dname)
+        if ret != 0:
+            raise RuntimeError("Failed to clone %s: %s" % (project, err))
+
+        errors[0] = _run_spellintian(ignored, os.path.join(dname, project))
+        errors[1] = _run_codespell(ignored, os.path.join(dname, project))
+
+    return errors
+
+
+def _check_latest(ignored):
+    errors = ["", ""]
+
+    errors[0] = _run_spellintian(ignored)
+    errors[1] = _run_codespell(ignored)
+
+    return errors
+
+
+def run_checks(project, ignored):
+    suc = True
+
+    stable_errors = _check_stable(project, ignored)
+    latest_errors = _check_latest(ignored)
+
+    lintian_new = [e for e in latest_errors[0] if e and not e in stable_errors[0]]
+    if lintian_new:
+        print("New spelling errors found by lintian:\n%s\n" % "\n".join(lintian_new))
+        suc = False
+
+    codespell_new = [e for e in latest_errors[1] if e and not e in stable_errors[1]]
+    if codespell_new:
+        print("New spelling errors found by codespell:\n%s\n" % "\n".join(codespell_new))
+        suc = False
+
+    return suc
+
+
+if __name__ == '__main__':
+
+    argparser = argparse.ArgumentParser(description='spell checker')
+    argparser.add_argument('-p', '--project', dest='project', action='store',
+                           help='project to run tests for', required=True)
+    argparser.add_argument('-i', '--ignore', dest='ignore', nargs='*', action='store',
+                           help='ignored words')
+    args = argparser.parse_args()
+
+    suc = run_checks(args.project, args.ignore)
+
+    sys.exit(0 if suc else 1)
