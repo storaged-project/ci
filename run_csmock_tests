@@ -35,7 +35,7 @@ def run_command(command, cwd=None):
                            stderr=subprocess.PIPE, cwd=cwd)
 
     out, err = res.communicate()
-    return (res.returncode, out.decode().strip(), err.decode().strip())
+    return (res.returncode, out.decode("utf-8", "replace").strip(), err.decode("utf-8", "replace").strip())
 
 
 def _get_tarball(output):
