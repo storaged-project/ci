@@ -1,0 +1,173 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+PROJECTS = {'libblockdev': {'git': 'https://github.com/storaged-project/libblockdev',
+                            'configure': './autogen.sh && ./configure --without-lvm_dbus --prefix=/usr'},
+            'libbytesize': {'git': 'https://github.com/storaged-project/libbytesize',
+                            'configure': './autogen.sh && ./configure --prefix=/usr'},
+            'volume_key': {'git': 'https://pagure.io/volume_key',
+                            'configure': 'autoreconf -i && ./configure --prefix=/usr'},
+            'libmount': {'git': 'https://github.com/util-linux/util-linux',
+                            'configure': './autogen.sh && ./configure --prefix=/usr '
+                            '--with-python=3 '
+                            '--disable-all-programs --enable-pylibmount '
+                            '--enable-libmount --enable-libblkid',
+                            'build_path': 'util-linux'}}
+
+# version of libmount installed on target system; effectively a tag name for pylibmount git
+
+
+def run_command(command, cwd=None):
+    res = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, cwd=cwd)
+
+    out, err = res.communicate()
+    if res.returncode != 0:
+        output = out.decode().strip() + '\n' + err.decode().strip()
+    else:
+        output = out.decode().strip()
+    return (res.returncode, output)
+
+
+def get_arch():
+    _ret, arch = run_command('uname -p')
+    return arch
+
+
+def get_distro():
+    _ret, distro = run_command('cat /etc/os-release | grep ^ID= | cut -d= -f2 | tr -d \"')
+    return distro
+
+
+def main(projects):
+
+    success = True
+    summary = ''
+
+    for project in projects:
+        if project not in PROJECTS.keys():
+            raise RuntimeError('Unknown project %s' % project)
+
+        print('=' * 25, project, '=' * 25)
+
+        tempname = tempfile.mkdtemp()
+
+        # clone the repo
+        print("Cloning '%s' repository into '%s'... " % (PROJECTS[project]['git'], tempname),
+              end='', flush=True)
+        ret, out = run_command('git clone --depth 1  %s' % PROJECTS[project]['git'], tempname)
+        if ret != 0:
+            print('*** Cloning %s failed:\n%s' % (project, out))
+            success = False
+            summary += '%s: FAILED\n' % project
+            continue
+        print('Done')
+
+        if project == 'libmount':
+
+            print("Getting libmount version... ", end='', flush=True)
+            ret, out = run_command('mount --version')
+            if ret != 0:
+                print('*** Getting mount version failed:\n%s' % out)
+                success = False
+                summary += '%s: FAILED\n' % project
+                continue
+
+            match = re.match("^.*libmount (.*):.*$", out)
+            if not match:
+                print('*** Getting mount version failed:\n%s' % out)
+                success = False
+                summary += '%s: FAILED\n' % project
+                continue
+
+            libmount_version = 'v'+match.group(1)
+
+            print('Done. (libmount version: %s)' % libmount_version)
+
+            # Python-libmount wrapper is a part of util-linux repo, paths have to be set accordingly
+            # Correct version of the repo has to be checked out as well.
+
+            workpath = os.path.join(tempname, PROJECTS[project]['build_path'], project)
+
+            print("Fetching tags (takes a minute)... ", end='', flush=True)
+            ret, out = run_command('git fetch origin +refs/tags/%s:refs/tags/%s' %
+                                   (libmount_version, libmount_version), cwd=workpath)
+            if ret != 0:
+                print('*** Fetching tags failed:\n%s' % out)
+                success = False
+                summary += '%s: FAILED\n' % project
+                continue
+            print('Done')
+
+            print("Checking out '%s'... " % libmount_version, end='', flush=True)
+
+            ret, out = run_command('git checkout tags/%s -b tag_temp' % libmount_version,
+                                   cwd=workpath)
+            if ret != 0:
+                print("*** Checking out tag '%s' failed:\n%s" % (libmount_version, out))
+                success = False
+                summary += '%s: FAILED\n' % project
+                continue
+            print('Done')
+
+        print("Running configure... ", end='', flush=True)
+        conf_cmd = PROJECTS[project]['configure']
+        if get_arch() == 'aarch64' and get_distro() == 'centos':
+            conf_cmd += ' --libdir=/usr/lib64'
+
+        ret, out = run_command(conf_cmd, os.path.join(tempname, PROJECTS[project].get('build_path',
+                                                                                      project)))
+        if ret != 0:
+            print('*** Configure of %s failed:\n%s' % (project, out))
+            success = False
+            summary += '%s: FAILED\n' % project
+            continue
+        print('Done')
+
+        print("Running make & make install... ", end='', flush=True)
+        ret, out = run_command('make -j6 && sudo make install',
+                               os.path.join(tempname,
+                                            PROJECTS[project].get('build_path', project)))
+        if ret != 0:
+            print('*** Installing of %s failed:\n%s' % (project, out))
+            success = False
+            summary += '%s: FAILED\n' % project
+            continue
+        print('Done')
+
+        if project == 'libmount':
+            python_ver = '.'.join(sys.version.split('.')[0:2])
+            print("Creating symlink 'dist-packages -> site-packages'... ", end='', flush=True)
+            ret, out = run_command('ln -fs /usr/lib/python%s/site-packages/libmount/ /usr/lib/python%s/dist-packages/libmount' % (python_ver, python_ver))
+            if ret != 0:
+                print('*** Symlink creation of %s failed:\n%s' % (project, out))
+                success = False
+                summary += '%s: FAILED\n' % project
+                continue
+            print('Done')
+
+        summary += '%s: OK\n' % project
+
+        shutil.rmtree(tempname)
+
+    print(summary)
+    return success
+
+if __name__ == '__main__':
+
+    argparser = argparse.ArgumentParser(description='libinstall')
+    argparser.add_argument('projects', nargs='+', action='store',
+                           help='projects to build')
+    args = argparser.parse_args()
+
+    suc = main(args.projects)
+
+    sys.exit(0 if suc else 1)
