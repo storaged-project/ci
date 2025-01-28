@@ -1,0 +1,35 @@
+#!/usr/bin/python3
+
+import argparse
+
+JSON_DATA_GH = """{ "github": { "requests": [ { "method": "POST", "resource": "/repos/%(repo)s/statuses/%(commit)s", "result": "status", """ + \
+               """"data": { "state": "%(status)s", "target_url": ":link", "description": "%(msg)s", "context": "%(context)s" }}]}}"""
+
+JSON_MSG = """{ "message": "%s" }"""
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Produce data for sink to update a pull request at GitHub")
+
+    ap.add_argument("-r", "--repo", action="store",
+                    help="'project/repository' specifier (e.g. 'cockpit-project/cockpit')")
+    ap.add_argument("-c", "--commit", action="store", help="SHA1 of the commit")
+    ap.add_argument("-s", "--status", action="store",
+                    choices=["pending", "success", "error", "failure"],
+                    help="status to set on the commit")
+    ap.add_argument("-m", "--msg", action="store",
+                    elp="message to set as the description of the status")
+    ap.add_argument("-x", "--context", action="store",
+                    help="context of the status (e.g. 'jenkins/x86_64'")
+    ap.add_argument("log_files", nargs='*',
+                    metavar="LOG_FILE",
+                    help="Log file to store and make part of the referenced 'details'")
+
+    args = ap.parse_args()
+    fields = {field: getattr(args, field) for field in ("repo", "commit", "status",
+                                                        "msg", "context")}
+
+    print(JSON_DATA_GH % fields)
+    for path in args.log_files:
+        with open(path, "r", encoding="utf-8") as f:
+            print(f.read())
+    print(JSON_MSG % args.msg, end="")
