@@ -17,7 +17,7 @@ if __name__ == "__main__":
                     choices=["pending", "success", "error", "failure"],
                     help="status to set on the commit")
     ap.add_argument("-m", "--msg", action="store",
-                    elp="message to set as the description of the status")
+                    help="message to set as the description of the status")
     ap.add_argument("-x", "--context", action="store",
                     help="context of the status (e.g. 'jenkins/x86_64'")
     ap.add_argument("log_files", nargs='*',
